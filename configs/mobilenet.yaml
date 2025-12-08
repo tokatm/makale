@@ -1,0 +1,40 @@
+model:
+  name: mobilenet
+  pretrained: true
+
+data:
+  root: "/content/drive/MyDrive/Dataset/dataset-2"
+  train_images: "images/train"
+  train_labels: "labels/train"
+  val_images: "images/val"
+  val_labels: "labels/val"
+  test_images: "images/test"
+  test_labels: "labels/test"
+  img_size: [640, 640]
+  batch_size: 32
+
+augment:
+  horizontal_flip: true
+  color_jitter: true
+  blur: true
+  rotation: true
+
+train:
+  epochs: 50
+  lr: 0.001
+  weight_decay: 0.0001
+  # Loss weights - regression daha önemli
+  cls_weight: 1.0
+  reg_weight: 2.0
+  iou_pos_thresh: 0.5   # güçlü IoU için sınır
+  iou_min: 0.1          # top-k sonrası minimum IoU
+  topk_per_gt: 3        # her GT için en fazla 3 anchor
+  max_pos_factor: 12    # max pozitif = 12 * gt_sayısı
+
+save:
+  exp_name: "mobilenet_exp"
+
+# Inference settings (optional)
+inference:
+  conf_threshold: 0.5
+  nms_threshold: 0.5

@@ -1,0 +1,56 @@
+experiment:
+  name: mobilenetv3_exp1
+  seed: 42
+
+data:
+  root: /Users/mustafa/Library/Mobile Documents/com~apple~CloudDocs/Computer_Science/09-Makalelerim/6-ADAS/Dataset
+  img_size: [640, 384]
+  batch_size: 32
+  num_workers: 0
+
+augment:
+  rotation:
+    angle_min: -15
+    angle_max: +15
+    p: 0.5
+  random_resize:
+    scale_min: 0.8
+    scale_max: 1.2
+    p: 1.0
+  motion_blur:
+    kernel_size: [3,7]
+    p: 0.2
+  lower_half_warp:
+    p: 0.3
+    max_offset: 0.05
+  gaussian_blur:
+    sigma_limit: [0.2, 0.5]
+    blur_limit: 0
+    p: 1.0
+  gamma:
+    p: 0.2
+
+
+train:
+  epochs: 2
+  optimizer:
+    name: AdamW
+    lr: 0.0003
+    weight_decay: 0.0005
+  scheduler:
+    name: cosine
+    T_max: 100
+    eta_min: 1e-6
+  early_stop:
+    monitor: val_loss 
+    patience: 10           
+    min_delta: 0.001       
+
+
+model:
+  name: mobilenetv3
+
+runtime:
+  measure_metrics: true
+
+
