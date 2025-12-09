@@ -3,6 +3,7 @@ import json
 import os
 import random
 from dataclasses import dataclass
+import math
 
 import albumentations as A
 import cv2
@@ -13,8 +14,11 @@ from torchvision import transforms
 from torchvision.models.detection import (
     FasterRCNN_MobileNet_V3_Large_FPN_Weights,
     fasterrcnn_mobilenet_v3_large_fpn,
+    RetinaNet_ResNet50_FPN_Weights,
+    retinanet_resnet50_fpn,
 )
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.retinanet import RetinaNetClassificationHead
 from tqdm import tqdm
 
 
@@ -25,11 +29,13 @@ def default_num_workers():
 
 @dataclass
 class TrainConfig:
-    batch_size: int = 8
-    num_epochs: int = 100
-    learning_rate: float = 0.005
-    num_classes: int = 2  # background + pothole
-    conf_threshold: float = 0.3
+    batch_size: int = 16  # Arttırıldı
+    num_epochs: int = 50  # Azaltıldı
+    learning_rate: float = 0.001  # DÜŞÜRÜLDÜ!
+    num_classes: int = 2
+    conf_threshold: float = 0.5  # Daha düşük başlangıç eşiği
+    model_name: str = 'retinanet'
+    backbone: str = 'resnet50'
     num_workers: int = default_num_workers()
     train_img_dir: str = os.path.join('dataset-2', 'images', 'train')
     train_label_dir: str = os.path.join('dataset-2', 'labels', 'train')
@@ -39,6 +45,7 @@ class TrainConfig:
     seed: int = 42
     use_amp: bool = True
     pretrained: bool = True
+    warmup_epochs: int = 5  # Yeni eklendi
 
 
 def seed_everything(seed: int):
@@ -104,6 +111,18 @@ class PotholeDataset(Dataset):
             pascal_boxes.append([x_min, y_min, x_max, y_max])
         
         return pascal_boxes
+    
+    def clip_pascal_boxes(self, boxes, img_width, img_height):
+        """Pascal VOC kutularını görüntü boyutuna sınırlar ve geçersizleri atar"""
+        clipped = []
+        for x_min, y_min, x_max, y_max in boxes:
+            x_min = np.clip(x_min, 0, img_width)
+            y_min = np.clip(y_min, 0, img_height)
+            x_max = np.clip(x_max, 0, img_width)
+            y_max = np.clip(y_max, 0, img_height)
+            if x_max > x_min and y_max > y_min:
+                clipped.append([x_min, y_min, x_max, y_max])
+        return clipped
     
     def clip_boxes(self, boxes):
         """Bbox koordinatlarını [0, 1] aralığına sınırla"""
@@ -176,6 +195,7 @@ class PotholeDataset(Dataset):
         # YOLO'dan Pascal VOC formatına dönüştür
         if len(boxes) > 0:
             boxes = self.yolo_to_pascal_voc(boxes, w, h)
+            boxes = self.clip_pascal_boxes(boxes, w, h)
             boxes = torch.as_tensor(boxes, dtype=torch.float32)
             labels = torch.as_tensor(labels, dtype=torch.int64)
         else:
@@ -187,15 +207,69 @@ class PotholeDataset(Dataset):
             'boxes': boxes,
             'labels': labels,
             'image_id': torch.tensor([idx]),
-            'area': (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0]) if len(boxes) > 0 else torch.zeros((0,)),
+            'area': (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0]) if len(boxes) > 0 else torch.zeros((0,), dtype=torch.float32),
             'iscrowd': torch.zeros((len(boxes),), dtype=torch.int64)
         }
         
         # Transform uygula
         if self.transforms:
             image = self.transforms(image)
+            
         
         return image, target
+
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+
+def debug_sample(dataset, idx=0, save_path=None):
+    """Bir örneği görselleştir"""
+    image, target = dataset[idx]
+    
+    # Tensor'ı numpy'a çevir
+    if torch.is_tensor(image):
+        # Inverse normalize: mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]
+        image_np = image.numpy().transpose(1, 2, 0)
+        image_np = image_np * [0.229, 0.224, 0.225] + [0.485, 0.456, 0.406]
+        image_np = np.clip(image_np, 0, 1)
+    else:
+        image_np = image
+    
+    fig, ax = plt.subplots(1, figsize=(12, 8))
+    ax.imshow(image_np)
+    
+    boxes = target['boxes'].cpu().numpy() if torch.is_tensor(target['boxes']) else target['boxes']
+    labels = target['labels'].cpu().numpy() if torch.is_tensor(target['labels']) else target['labels']
+    
+    print(f"Image shape: {image_np.shape}")
+    print(f"Number of boxes: {len(boxes)}")
+    print(f"Labels: {labels}")
+    
+    for box, label in zip(boxes, labels):
+        x1, y1, x2, y2 = box
+        w, h = x2 - x1, y2 - y1
+        
+        # Kutu çiz
+        rect = patches.Rectangle(
+            (x1, y1), w, h, 
+            linewidth=2, edgecolor='r', facecolor='none'
+        )
+        ax.add_patch(rect)
+        
+        # Label yaz
+        ax.text(x1, y1-5, f'Pothole ({label})', 
+                color='white', fontsize=10, 
+                bbox=dict(facecolor='red', alpha=0.8))
+    
+    ax.axis('off')
+    
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight', dpi=100)
+        print(f"Saved to {save_path}")
+    else:
+        plt.show()
+    
+    plt.close()
+
 
 
 def get_transform(train=False):
@@ -215,21 +289,131 @@ def collate_fn(batch):
     return tuple(zip(*batch))
 
 
+def clean_batch(images, targets, device):
+    """Kutuları doğrula, ters/NaN kutuları at ve tensörleri cihaza taşı"""
+    processed_images = []
+    processed_targets = []
+    
+    for img, tgt in zip(images, targets):
+        img = img.to(device)
+        tgt = {k: v.to(device) if hasattr(v, 'to') else v for k, v in tgt.items()}
+        boxes = tgt['boxes']
+        
+        if boxes.numel() > 0:
+            finite_mask = torch.isfinite(boxes).all(dim=1)
+            size_mask = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+            keep = finite_mask & size_mask
+            
+            if keep.any():
+                tgt = tgt.copy()
+                tgt['boxes'] = boxes[keep]
+                if len(tgt['labels']) == len(boxes):
+                    tgt['labels'] = tgt['labels'][keep]
+                tgt['area'] = (tgt['boxes'][:, 3] - tgt['boxes'][:, 1]) * (tgt['boxes'][:, 2] - tgt['boxes'][:, 0])
+            else:
+                tgt = tgt.copy()
+                tgt['boxes'] = boxes.new_zeros((0, 4))
+                tgt['labels'] = torch.zeros((0,), dtype=torch.int64, device=boxes.device)
+                tgt['area'] = boxes.new_zeros((0,))
+        else:
+            # Boş kutu: negatif örnek
+            tgt = tgt.copy()
+            tgt['boxes'] = boxes
+            tgt['area'] = boxes.new_zeros((0,)) if hasattr(boxes, 'new_zeros') else torch.zeros((0,), device=device)
+        
+        processed_images.append(img)
+        processed_targets.append(tgt)
+    
+    return processed_images, processed_targets
+
+
 # ============================================================================
 # 2. MODEL OLUŞTURMA
 # ============================================================================
-
-def create_model(num_classes=2, pretrained=True):
-    """MobileNetV3 backbone ile Faster R-CNN modeli oluştur"""
+def create_faster_rcnn_optimized(num_classes=2, pretrained=True):
+    from torchvision.models.detection import (
+        FasterRCNN_ResNet50_FPN_Weights,
+        fasterrcnn_resnet50_fpn
+    )
     
-    # Pretrained model yükle
-    weights = FasterRCNN_MobileNet_V3_Large_FPN_Weights.DEFAULT if pretrained else None
-    model = fasterrcnn_mobilenet_v3_large_fpn(weights=weights)
+    weights = FasterRCNN_ResNet50_FPN_Weights.DEFAULT if pretrained else None
+    model = fasterrcnn_resnet50_fpn(weights=weights)
     
-    # Classifier'ı değiştir
+    # Classifier değiştir
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
     
+    # 🔧 RPN ANCHOR'LARINI AYARLA
+    from torchvision.models.detection.anchor_utils import AnchorGenerator
+    
+    anchor_sizes = ((32,), (64,), (128,), (256,), (512,))
+    aspect_ratios = ((0.5, 1.0, 2.0),) * len(anchor_sizes)
+    
+    model.rpn.anchor_generator = AnchorGenerator(
+        sizes=anchor_sizes,
+        aspect_ratios=aspect_ratios
+    )
+    
+    # 🔧 RPN HİPERPARAMETRELER
+    model.rpn.fg_iou_thresh = 0.5  # 0.7 → 0.5 (daha kolay positive)
+    model.rpn.bg_iou_thresh = 0.3  # 0.3 sabit
+    model.rpn.batch_size_per_image = 512  # 256 → 512
+    model.rpn.positive_fraction = 0.5  # 0.5 sabit
+    
+    # 🔧 ROI HEAD HİPERPARAMETRELER
+    model.roi_heads.fg_iou_thresh = 0.5  # 0.5 sabit
+    model.roi_heads.bg_iou_thresh = 0.5  # 0.5 sabit
+    model.roi_heads.batch_size_per_image = 512  # 512 sabit
+    model.roi_heads.positive_fraction = 0.5  # 0.25 → 0.5
+    
+    print("create_faster_rcnn_optimized done")
+    return model
+
+def create_model(num_classes=2, pretrained=True, backbone='resnet50', model_name='retinanet'):
+    """RetinaNet veya Faster R-CNN modelini kurar"""
+    
+    if model_name == 'retinanet':
+        weights = RetinaNet_ResNet50_FPN_Weights.DEFAULT if pretrained else None
+        model = retinanet_resnet50_fpn(weights=weights)
+        # Kafa yeniden kur: num_classes'e göre
+        num_anchors = model.head.classification_head.num_anchors
+        in_channels = model.backbone.out_channels
+        model.head.classification_head = RetinaNetClassificationHead(
+            in_channels,
+            num_anchors,
+            num_classes,
+            norm_layer=None
+        )
+        # Bias/weight init (prior=0.01 ile başlangıçta düşük pozitif olasılığı ver)
+        torch.nn.init.normal_(model.head.classification_head.cls_logits.weight, std=0.01)
+        prior_prob = 0.01
+        bias_value = -math.log((1 - prior_prob) / prior_prob)
+        torch.nn.init.constant_(model.head.classification_head.cls_logits.bias, bias_value)
+        print("retinanet_resnet50_fpn")
+    else:
+        # Faster R-CNN (resnet50 veya mobilenet)
+        if backbone == 'resnet50':
+            from torchvision.models.detection import (
+                FasterRCNN_ResNet50_FPN_Weights,
+                fasterrcnn_resnet50_fpn
+            )
+            weights = FasterRCNN_ResNet50_FPN_Weights.DEFAULT if pretrained else None
+            model = fasterrcnn_resnet50_fpn(weights=weights)
+            print("fasterrcnn_resnet50_fpn")
+        else:
+            weights = FasterRCNN_MobileNet_V3_Large_FPN_Weights.DEFAULT if pretrained else None
+            model = fasterrcnn_mobilenet_v3_large_fpn(weights=weights)
+            print("fasterrcnn_mobilenet_v3")
+        
+        # Classifier'ı değiştir
+        in_features = model.roi_heads.box_predictor.cls_score.in_features
+        model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+        
+        # Anchor box ayarlarını optimize et (çukur boyutlarına göre)
+        if hasattr(model, 'anchor_generator'):
+            model.anchor_generator.sizes = ((32,), (64,), (128,), (256,), (512,))
+            model.anchor_generator.aspect_ratios = ((0.5, 1.0, 2.0),) * len(model.anchor_generator.sizes)
+    print("create_model done")
     return model
 
 
@@ -237,47 +421,62 @@ def create_model(num_classes=2, pretrained=True):
 # 3. EĞİTİM FONKSİYONLARI
 # ============================================================================
 
-def train_one_epoch(model, optimizer, data_loader, device, epoch, scaler=None):
-    """Bir epoch eğitim"""
+
+def train_one_epoch(model, optimizer, data_loader, device, epoch, scaler=None, warmup_epochs=5):
+    """Warmup ve gradient clipping ile geliştirilmiş eğitim"""
     model.train()
     total_loss = 0
     num_steps = 0
     
     pbar = tqdm(data_loader, desc=f'Epoch {epoch}')
-    for images, targets in pbar:
+    for batch_idx, (images, targets) in enumerate(pbar):
+        # Warmup learning rate (initial_lr yoksa mevcut lr'yi baz al)
+        if epoch <= warmup_epochs:
+            warmup_factor = min(1.0, (batch_idx + 1) / len(data_loader))
+            for param_group in optimizer.param_groups:
+                base_lr = param_group.get('initial_lr', param_group['lr'])
+                param_group['lr'] = base_lr * warmup_factor
+        
         use_amp = scaler is not None and scaler.is_enabled()
-        # Boş target'ları filtrele
-        valid_samples = []
-        valid_targets = []
+        images, targets = clean_batch(images, targets, device)
         
-        for img, tgt in zip(images, targets):
-            if len(tgt['boxes']) > 0:  # En az 1 çukur varsa
-                valid_samples.append(img)
-                valid_targets.append(tgt)
-        
-        if len(valid_samples) == 0:
-            continue
-        
-        images = [image.to(device) for image in valid_samples]
-        targets = [{k: v.to(device) for k, v in t.items()} for t in valid_targets]
-        
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast('cuda', enabled=use_amp):
             loss_dict = model(images, targets)
-            losses = sum(loss for loss in loss_dict.values())
+
+            # DEBUG: İlk batch'te key'leri yazdır
+            if epoch == 1 and batch_idx == 0:
+                print("\nLoss Dictionary Keys:", list(loss_dict.keys()))
+            
+            # RetinaNet ve Faster R-CNN için farklı loss anahtarlarını yönet
+            if 'loss_classifier' in loss_dict:
+                losses = loss_dict['loss_classifier'] * 2.0 + \
+                        loss_dict['loss_box_reg'] * 1.0 + \
+                        loss_dict['loss_objectness'] * 1.0 + \
+                        loss_dict['loss_rpn_box_reg'] * 1.0
+            else:
+                # RetinaNet: classification + bbox_regression
+                losses = loss_dict.get('classification', 0) + loss_dict.get('bbox_regression', 0)
         
         optimizer.zero_grad(set_to_none=True)
 
         if use_amp:
             scaler.scale(losses).backward()
+            # Gradient clipping
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             losses.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
         
         total_loss += losses.item()
         num_steps += 1
-        pbar.set_postfix({'loss': f'{losses.item():.4f}'})
+        pbar.set_postfix({
+            'loss': f'{losses.item():.4f}',
+            'lr': f"{optimizer.param_groups[0]['lr']:.6f}"
+        })
     
     return total_loss / max(num_steps, 1)
 
@@ -310,23 +509,38 @@ def evaluate_model(model, data_loader, device, iou_threshold=0.5, conf_threshold
     iou_count = 0
     
     with torch.inference_mode():
-        for images, targets in tqdm(data_loader, desc='Evaluating'):
+        for batch_idx, (images, targets) in enumerate(tqdm(data_loader, desc='Evaluating')):
             images = [img.to(device) for img in images]
             outputs = model(images)
             
-            for output, target in zip(outputs, targets):
+            for i, (output, target) in enumerate(zip(outputs, targets)):
                 pred_boxes = output['boxes'].cpu().numpy()
                 pred_scores = output['scores'].cpu().numpy()
-                
-                gt_boxes = target['boxes'].cpu().numpy()
+
+                # NMS uygula
+                if len(pred_boxes) > 0:
+                    import torchvision.ops as ops
+                    nms_indices = ops.nms(
+                        torch.tensor(pred_boxes),
+                        torch.tensor(pred_scores),
+                        iou_threshold=0.3
+                    )
+                    pred_boxes = pred_boxes[nms_indices]
+                    pred_scores = pred_scores[nms_indices]
                 
                 # Confidence threshold uygula
                 mask = pred_scores >= conf_threshold
                 pred_boxes = pred_boxes[mask]
                 pred_scores = pred_scores[mask]
                 
+                gt_boxes = target['boxes'].cpu().numpy()
+                
                 if len(gt_boxes) == 0:
                     fp += len(pred_boxes)
+                    continue
+                
+                if len(pred_boxes) == 0:
+                    fn += len(gt_boxes)
                     continue
                 
                 matched_pred = set()
@@ -363,7 +577,7 @@ def evaluate_model(model, data_loader, device, iou_threshold=0.5, conf_threshold
         'Precision': precision,
         'Recall': recall,
         'F1-Score': f1_score,
-        'mAP@0.5': precision,  # Simplified mAP
+        'mAP@0.5': precision,
         'Mean IoU': mean_iou,
         'True Positives': tp,
         'False Positives': fp,
@@ -372,6 +586,24 @@ def evaluate_model(model, data_loader, device, iou_threshold=0.5, conf_threshold
     }
     
     return metrics
+
+
+def evaluate_loss(model, data_loader, device, use_amp=False):
+    """Validation loss hesaplar"""
+    model.eval()
+    total_loss = 0.0
+    steps = 0
+    
+    with torch.inference_mode():
+        for images, targets in data_loader:
+            images, targets = clean_batch(images, targets, device)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                loss_dict = model(images, targets)
+                losses = sum(loss for loss in loss_dict.values())
+            total_loss += losses.item()
+            steps += 1
+    
+    return total_loss / max(steps, 1)
 
 
 def print_metrics_for_paper(metrics):
@@ -406,6 +638,7 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=None, help='Rastgelelik için seed')
     parser.add_argument('--no-amp', action='store_true', help='Mixed precision kapat')
     parser.add_argument('--no-pretrained', action='store_true', help='Pretrained backbone kullanma')
+    parser.add_argument('--model', type=str, default=None, choices=['retinanet', 'fasterrcnn'], help='Model tipi')
     parser.add_argument('--device', type=str, default=None, help='cuda veya cpu')
     return parser.parse_args()
 
@@ -444,6 +677,8 @@ def main():
         config.use_amp = False
     if args.no_pretrained:
         config.pretrained = False
+    if args.model:
+        config.model_name = args.model
     
     device = torch.device(
         args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -455,8 +690,9 @@ def main():
     if hasattr(torch, 'set_float32_matmul_precision'):
         torch.set_float32_matmul_precision('medium')
     
+    amp_active = config.use_amp and device.type == "cuda"
     print(f'Using device: {device}')
-    print(f'Pin memory: {pin_memory} | Workers: {config.num_workers} | AMP: {config.use_amp and device.type == \"cuda\"}')
+    print(f'Pin memory: {pin_memory} | Workers: {config.num_workers} | AMP: {amp_active}')
     
     # Dataset ve DataLoader
     print('Loading datasets...')
@@ -491,19 +727,33 @@ def main():
         persistent_workers=config.num_workers > 0,
         collate_fn=collate_fn
     )
+    # Kullanım:
+    debug_sample(train_dataset, idx=0)
+    debug_sample(val_dataset, idx=10)
     
     print(f'Train samples: {len(train_dataset)}')
     print(f'Val samples: {len(val_dataset)}')
     
     # Model oluştur
     print('\nCreating model...')
-    model = create_model(num_classes=config.num_classes, pretrained=config.pretrained)
+    model = create_faster_rcnn_optimized(
+        num_classes=config.num_classes,
+        pretrained=config.pretrained)
     model.to(device)
     
     # Optimizer ve scheduler
     params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(params, lr=config.learning_rate, weight_decay=1e-4)
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.num_epochs)
+    optimizer = torch.optim.SGD(
+        params, 
+        lr=config.learning_rate,
+        momentum=0.9,
+        weight_decay=0.0005
+    )
+    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer,
+        milestones=[20, 40],
+        gamma=0.1
+    )
     scaler = torch.cuda.amp.GradScaler(enabled=config.use_amp and device.type == 'cuda')
     
     # Eğitim
@@ -513,15 +763,40 @@ def main():
     best_model_path = os.path.join(config.output_dir, 'best_pothole_model.pth')
     metrics_path = os.path.join(config.output_dir, 'metrics.json')
     
+    # Main fonksiyonunda:
     for epoch in range(1, config.num_epochs + 1):
-        train_loss = train_one_epoch(model, optimizer, train_loader, device, epoch, scaler=scaler)
-        lr_scheduler.step()
-        print(f'Epoch {epoch} - train loss: {train_loss:.4f}')
+        # Warmup uygula (ilk 5 epoch)
+        warmup = epoch <= config.warmup_epochs
+        train_loss = train_one_epoch(
+            model, optimizer, train_loader, device, 
+            epoch, scaler=scaler, warmup_epochs=config.warmup_epochs
+        )
         
-        if epoch % 5 == 0:
+        # WARMUP BİTTİKTEN SONRA scheduler'ı kullan
+        if epoch > config.warmup_epochs:
+            lr_scheduler.step()
+        
+        print(f'Epoch {epoch} - train loss: {train_loss:.4f} - LR: {optimizer.param_groups[0]["lr"]:.6f}')
+        
+        # Validation için CONFIDENCE THRESHOLD'U DÜŞÜR
+        if epoch % 3 == 0:
             print(f'\nValidating epoch {epoch}...')
-            metrics = evaluate_model(model, val_loader, device, conf_threshold=config.conf_threshold)
+            # İlk validation'larda çok düşük threshold kullan
+            current_threshold = max(0.05, config.conf_threshold)  # En az 0.05
+            metrics = evaluate_model(model, val_loader, device, conf_threshold=current_threshold)
             print_metrics_for_paper(metrics)
+            
+            # Dynamic threshold: hiç tahmin yoksa eşiği düşür, FP ağır basıyorsa yükselt
+            tp, fp = metrics['True Positives'], metrics['False Positives']
+            if tp == 0 and fp == 0:
+                config.conf_threshold = max(0.05, config.conf_threshold - 0.05)
+                print(f'↓ No predictions; confidence threshold decreased to {config.conf_threshold:.2f}')
+            elif fp > tp and metrics['Precision'] < 0.4:
+                config.conf_threshold = min(config.conf_threshold + 0.05, 0.8)
+                print(f'↑ High FP; confidence threshold increased to {config.conf_threshold:.2f}')
+            elif metrics['Recall'] < 0.4:
+                config.conf_threshold = max(config.conf_threshold - 0.05, 0.05)
+                print(f'↓ Low recall; confidence threshold decreased to {config.conf_threshold:.2f}')
             
             if metrics['F1-Score'] > best_f1:
                 best_f1 = metrics['F1-Score']
