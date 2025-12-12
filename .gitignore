@@ -3,4 +3,5 @@
 !*.py
 !*.yaml
 !**/*.py
+!*.ipynb
 !.gitignore

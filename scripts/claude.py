@@ -63,37 +63,17 @@ def seed_everything(seed: int):
 class PotholeDataset(Dataset):
     """YOLO formatındaki çukur verilerini PyTorch object detection formatına dönüştürür"""
     
-    def __init__(self, image_dir, label_dir, transforms=None, augment=False):
+    def __init__(self, image_dir, label_dir, transforms=None):
         self.image_dir = image_dir
         self.label_dir = label_dir
         self.transforms = transforms
-        self.augment = augment
+    
         
         # Resim dosyalarını listele
         self.images = [f for f in os.listdir(image_dir) 
                       if f.endswith(('.jpg', '.jpeg', '.png'))]
         
-        # Augmentation pipeline
-        if augment:
-            self.aug_transform = A.Compose([
-                A.HorizontalFlip(p=0.5),
-                A.RandomBrightnessContrast(p=0.3),
-                A.GaussNoise(p=0.2),
-                A.Blur(blur_limit=3, p=0.2),
-                A.RandomGamma(p=0.2),
-                A.CLAHE(p=0.2),
-                A.ColorJitter(p=0.2),
-                A.RandomRotate90(p=0.3),
-                A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, 
-                                  rotate_limit=10, p=0.3),
-            ], bbox_params=A.BboxParams(
-                format='yolo', 
-                label_fields=['class_labels'],
-                min_area=0,
-                min_visibility=0.3,
-                clip=True
-            ))
-    
+     
     def __len__(self):
         return len(self.images)
     
@@ -173,24 +153,12 @@ class PotholeDataset(Dataset):
                             boxes.append([x_center, y_center, width, height])
                             labels.append(1)  # PyTorch: 0=background, 1=pothole
         
-        # Augmentation uygula
-        if self.augment and len(boxes) > 0:
-            try:
-                augmented = self.aug_transform(
-                    image=image,
-                    bboxes=boxes,
-                    class_labels=labels
-                )
-                image = augmented['image']
-                boxes = augmented['bboxes']
-                labels = augmented['class_labels']
-                
-                # Augmentation sonrası tekrar clip et
-                if len(boxes) > 0:
-                    boxes = self.clip_boxes(boxes)
-            except Exception as e:
-                # Augmentation hata verirse orijinal değerleri kullan
-                pass
+        # Transform uygula
+        if self.transforms:
+            t = self.transforms(image=image, bboxes=boxes, class_labels=labels)
+            image = t["image"]
+            boxes = t["bboxes"]
+            labels = t["class_labels"]
         
         # YOLO'dan Pascal VOC formatına dönüştür
         if len(boxes) > 0:
@@ -211,9 +179,7 @@ class PotholeDataset(Dataset):
             'iscrowd': torch.zeros((len(boxes),), dtype=torch.int64)
         }
         
-        # Transform uygula
-        if self.transforms:
-            image = self.transforms(image)
+      
             
         
         return image, target
@@ -270,19 +236,48 @@ def debug_sample(dataset, idx=0, save_path=None):
     
     plt.close()
 
-
-
-def get_transform(train=False):
-    """Temel transform pipeline"""
-    transforms_list = []
-    # Albumentations sonrası torch tensor + normalize
-    transforms_list.append(transforms.ToTensor())
-    transforms_list.append(transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
+def train_aug():
+       # Augmentation pipeline
+    aug_transform = A.Compose([
+        A.RandomScale(scale_limit=0.2, p=0.5),
+        A.HorizontalFlip(p=0.5),
+        A.RandomBrightnessContrast(
+                    brightness_limit=0.4, 
+                    contrast_limit=0.4, 
+                    brightness_by_max=True,
+                    p=0.7),
+        A.GaussNoise(p=0.2),
+        A.Blur(blur_limit=3, p=0.2),
+        A.RandomRotate90(p=0.3),
+        A.Affine(
+            scale=(0.8, 1.2),
+            translate_percent=(-0.1, 0.1),
+            rotate=(-10, 10),
+            shear=(-5, 5),
+            p=0.4
+        ),
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        A.ToTensorV2()
+    ], bbox_params=A.BboxParams(
+        format='yolo', 
+        label_fields=['class_labels'],
+        min_area=0,
+        min_visibility=0.3,
+        clip=True
     ))
-    return transforms.Compose(transforms_list)
-
+    return aug_transform
+    
+def val_aug():
+    Ag = A.Compose([
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        A.ToTensorV2()], bbox_params=A.BboxParams(
+            format='yolo', 
+            label_fields=['class_labels'],
+            min_area=0,
+            min_visibility=0.3,
+            clip=True))
+    return Ag
+    
 
 def collate_fn(batch):
     """DataLoader için custom collate function"""
@@ -346,8 +341,8 @@ def create_faster_rcnn_optimized(num_classes=2, pretrained=True):
     # 🔧 RPN ANCHOR'LARINI AYARLA
     from torchvision.models.detection.anchor_utils import AnchorGenerator
     
-    anchor_sizes = ((32,), (64,), (128,), (256,), (512,))
-    aspect_ratios = ((0.5, 1.0, 2.0),) * len(anchor_sizes)
+    anchor_sizes = ((16,), (32,), (64,), (128,), (256,), (512,))  # 6 seviye
+    aspect_ratios = ((0.5, 1.0, 2.0, 4.0),) * len(anchor_sizes)
     
     model.rpn.anchor_generator = AnchorGenerator(
         sizes=anchor_sizes,
@@ -698,14 +693,12 @@ def main():
     print('Loading datasets...')
     train_dataset = PotholeDataset(
         config.train_img_dir, config.train_label_dir,
-        transforms=get_transform(train=True),
-        augment=True
+        transforms=train_aug()
     )
     
     val_dataset = PotholeDataset(
         config.val_img_dir, config.val_label_dir,
-        transforms=get_transform(train=False),
-        augment=False
+        transforms=val_aug()
     )
     
     train_loader = DataLoader(
@@ -782,12 +775,12 @@ def main():
         if epoch % 3 == 0:
             print(f'\nValidating epoch {epoch}...')
             # İlk validation'larda çok düşük threshold kullan
-            current_threshold = max(0.05, config.conf_threshold)  # En az 0.05
+            current_threshold = 0.3
             metrics = evaluate_model(model, val_loader, device, conf_threshold=current_threshold)
             print_metrics_for_paper(metrics)
             
             # Dynamic threshold: hiç tahmin yoksa eşiği düşür, FP ağır basıyorsa yükselt
-            tp, fp = metrics['True Positives'], metrics['False Positives']
+            """tp, fp = metrics['True Positives'], metrics['False Positives']
             if tp == 0 and fp == 0:
                 config.conf_threshold = max(0.05, config.conf_threshold - 0.05)
                 print(f'↓ No predictions; confidence threshold decreased to {config.conf_threshold:.2f}')
@@ -801,7 +794,7 @@ def main():
             if metrics['F1-Score'] > best_f1:
                 best_f1 = metrics['F1-Score']
                 torch.save(model.state_dict(), best_model_path)
-                print(f'✓ Best model saved! F1-Score: {best_f1:.4f}')
+                print(f'✓ Best model saved! F1-Score: {best_f1:.4f}')"""
     
     print('\n\nFINAL EVALUATION:')
     if os.path.exists(best_model_path):
@@ -809,8 +802,20 @@ def main():
         final_metrics = evaluate_model(model, val_loader, device, conf_threshold=config.conf_threshold)
         print_metrics_for_paper(final_metrics)
         
+        # JSON için numpy/tensor tiplerini dönüştür
+        final_metrics_json = {}
+        for k, v in final_metrics.items():
+            if isinstance(v, (np.floating,)):
+                final_metrics_json[k] = float(v)
+            elif isinstance(v, (np.integer,)):
+                final_metrics_json[k] = int(v)
+            elif hasattr(v, 'item'):
+                final_metrics_json[k] = v.item()
+            else:
+                final_metrics_json[k] = v
+        
         with open(metrics_path, 'w') as f:
-            json.dump(final_metrics, f, indent=4)
+            json.dump(final_metrics_json, f, indent=4)
         
         print('\n✓ Training completed!')
         print(f'✓ Model saved: {best_model_path}')
