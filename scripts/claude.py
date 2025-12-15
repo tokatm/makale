@@ -10,7 +10,6 @@ import cv2
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
 from torchvision.models.detection import (
     FasterRCNN_MobileNet_V3_Large_FPN_Weights,
     fasterrcnn_mobilenet_v3_large_fpn,
@@ -20,6 +19,9 @@ from torchvision.models.detection import (
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.retinanet import RetinaNetClassificationHead
 from tqdm import tqdm
+import sys
+if 'ipykernel' in sys.modules:
+    sys.argv = [sys.argv[0]]
 
 
 def default_num_workers():
@@ -29,12 +31,12 @@ def default_num_workers():
 
 @dataclass
 class TrainConfig:
-    batch_size: int = 16  # Arttırıldı
-    num_epochs: int = 50  # Azaltıldı
-    learning_rate: float = 0.001  # DÜŞÜRÜLDÜ!
+    batch_size: int = 16
+    num_epochs: int = 70
+    learning_rate: float = 0.001
     num_classes: int = 2
-    conf_threshold: float = 0.5  # Daha düşük başlangıç eşiği
-    model_name: str = 'retinanet'
+    conf_threshold: float = 0.05
+    model_name: str = 'fasterrcnn'
     backbone: str = 'resnet50'
     num_workers: int = default_num_workers()
     train_img_dir: str = os.path.join('dataset-2', 'images', 'train')
@@ -45,7 +47,7 @@ class TrainConfig:
     seed: int = 42
     use_amp: bool = True
     pretrained: bool = True
-    warmup_epochs: int = 5  # Yeni eklendi
+    warmup_epochs: int = 5
 
 
 def seed_everything(seed: int):
@@ -54,11 +56,59 @@ def seed_everything(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.benchmark = True  # performans için açık
+    torch.backends.cudnn.benchmark = True
 
-# ============================================================================
-# 1. VERİ SETİ HAZIRLAMA
-# ============================================================================
+
+def get_augmentation_pipeline(train=True):
+    """
+    Albumentations pipeline'ını oluşturur.
+    ToTensorV2 ve Normalize dahildir.
+    """
+    if train:
+        transform = A.Compose([
+            # Augmentations
+            A.HorizontalFlip(p=0.5),
+            A.RandomBrightnessContrast(
+                brightness_limit=0.2, 
+                contrast_limit=0.2, 
+                brightness_by_max=True,
+                p=0.5),
+            A.GaussNoise(std_range= [0.01,0.07], p=0.2),
+            A.Blur(blur_limit=[1,4], p=0.2),         
+          
+            A.ShiftScaleRotate(shift_limit= [-0.0625, 0.0625], scale_limit=[-0.1,0.1], 
+                              rotate_limit=[-10,10], p=0.3),
+            # Normalization ve ToTensorV2
+            A.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            ),
+            A.ToTensorV2()
+        ], bbox_params=A.BboxParams(
+            format='yolo', 
+            label_fields=['class_labels'],
+            min_area=0,
+            min_visibility=0.3,
+            clip=True
+        ))
+    else:
+        # Validation için sadece normalization ve ToTensorV2
+        transform = A.Compose([
+            A.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            ),
+            A.ToTensorV2()
+        ], bbox_params=A.BboxParams(
+            format='yolo', 
+            label_fields=['class_labels'],
+            min_area=0,
+            min_visibility=0.3,
+            clip=True
+        ))
+    
+    return transform
+
 
 class PotholeDataset(Dataset):
     """YOLO formatındaki çukur verilerini PyTorch object detection formatına dönüştürür"""
@@ -67,13 +117,10 @@ class PotholeDataset(Dataset):
         self.image_dir = image_dir
         self.label_dir = label_dir
         self.transforms = transforms
-    
         
-        # Resim dosyalarını listele
         self.images = [f for f in os.listdir(image_dir) 
                       if f.endswith(('.jpg', '.jpeg', '.png'))]
-        
-     
+    
     def __len__(self):
         return len(self.images)
     
@@ -113,7 +160,6 @@ class PotholeDataset(Dataset):
             width = np.clip(box[2], 0.0, 1.0)
             height = np.clip(box[3], 0.0, 1.0)
             
-            # Box'un görüntü dışına çıkmasını engelle
             x_center = np.clip(x_center, width/2, 1.0 - width/2)
             y_center = np.clip(y_center, height/2, 1.0 - height/2)
             
@@ -121,14 +167,12 @@ class PotholeDataset(Dataset):
         return clipped_boxes
     
     def __getitem__(self, idx):
-        # Resmi yükle
         img_name = self.images[idx]
         img_path = os.path.join(self.image_dir, img_name)
         image = cv2.imread(img_path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         h, w = image.shape[:2]
         
-        # Label dosyasını yükle
         label_name = os.path.splitext(img_name)[0] + '.txt'
         label_path = os.path.join(self.label_dir, label_name)
         
@@ -142,25 +186,27 @@ class PotholeDataset(Dataset):
                     parts = line.strip().split()
                     if len(parts) == 5:
                         class_id = int(parts[0])
-                        # class_id=0 çukur demek, PyTorch için 1 yapıyoruz (0 background için ayrılı)
-                        if class_id == 0:  # Sadece çukurları al
+                        if class_id == 0:
                             x_center, y_center, width, height = map(float, parts[1:])
-                            # Koordinatları clip et
                             x_center = np.clip(x_center, 0.0, 1.0)
                             y_center = np.clip(y_center, 0.0, 1.0)
                             width = np.clip(width, 0.0, 1.0)
                             height = np.clip(height, 0.0, 1.0)
                             boxes.append([x_center, y_center, width, height])
-                            labels.append(1)  # PyTorch: 0=background, 1=pothole
+                            labels.append(1)
         
-        # Transform uygula
+        # Albumentations transformunu uygula
         if self.transforms:
-            t = self.transforms(image=image, bboxes=boxes, class_labels=labels)
-            image = t["image"]
-            boxes = t["bboxes"]
-            labels = t["class_labels"]
+            transformed = self.transforms(
+                image=image,
+                bboxes=boxes,
+                class_labels=labels
+            )
+            image = transformed['image']  # ToTensorV2 ile tensor'e dönüştü
+            boxes = transformed['bboxes']
+            labels = transformed['class_labels']
+            h, w = image.shape[1], image.shape[2]
         
-        # YOLO'dan Pascal VOC formatına dönüştür
         if len(boxes) > 0:
             boxes = self.yolo_to_pascal_voc(boxes, w, h)
             boxes = self.clip_pascal_boxes(boxes, w, h)
@@ -170,7 +216,6 @@ class PotholeDataset(Dataset):
             boxes = torch.zeros((0, 4), dtype=torch.float32)
             labels = torch.zeros((0,), dtype=torch.int64)
         
-        # Target dictionary oluştur
         target = {
             'boxes': boxes,
             'labels': labels,
@@ -179,10 +224,8 @@ class PotholeDataset(Dataset):
             'iscrowd': torch.zeros((len(boxes),), dtype=torch.int64)
         }
         
-      
-            
-        
         return image, target
+
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -191,9 +234,9 @@ def debug_sample(dataset, idx=0, save_path=None):
     """Bir örneği görselleştir"""
     image, target = dataset[idx]
     
-    # Tensor'ı numpy'a çevir
+    # Tensor'ı numpy'a çevir (ToTensorV2 sonrası)
     if torch.is_tensor(image):
-        # Inverse normalize: mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]
+        # Inverse normalize: mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
         image_np = image.numpy().transpose(1, 2, 0)
         image_np = image_np * [0.229, 0.224, 0.225] + [0.485, 0.456, 0.406]
         image_np = np.clip(image_np, 0, 1)
@@ -214,14 +257,12 @@ def debug_sample(dataset, idx=0, save_path=None):
         x1, y1, x2, y2 = box
         w, h = x2 - x1, y2 - y1
         
-        # Kutu çiz
         rect = patches.Rectangle(
             (x1, y1), w, h, 
             linewidth=2, edgecolor='r', facecolor='none'
         )
         ax.add_patch(rect)
         
-        # Label yaz
         ax.text(x1, y1-5, f'Pothole ({label})', 
                 color='white', fontsize=10, 
                 bbox=dict(facecolor='red', alpha=0.8))
@@ -236,48 +277,60 @@ def debug_sample(dataset, idx=0, save_path=None):
     
     plt.close()
 
-def train_aug():
-       # Augmentation pipeline
-    aug_transform = A.Compose([
-        A.RandomScale(scale_limit=0.2, p=0.5),
-        A.HorizontalFlip(p=0.5),
-        A.RandomBrightnessContrast(
-                    brightness_limit=0.4, 
-                    contrast_limit=0.4, 
-                    brightness_by_max=True,
-                    p=0.7),
-        A.GaussNoise(p=0.2),
-        A.Blur(blur_limit=3, p=0.2),
-        A.RandomRotate90(p=0.3),
-        A.Affine(
-            scale=(0.8, 1.2),
-            translate_percent=(-0.1, 0.1),
-            rotate=(-10, 10),
-            shear=(-5, 5),
-            p=0.4
-        ),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        A.ToTensorV2()
-    ], bbox_params=A.BboxParams(
-        format='yolo', 
-        label_fields=['class_labels'],
-        min_area=0,
-        min_visibility=0.3,
-        clip=True
-    ))
-    return aug_transform
+def debug_batch_samples(dataset, output_dir='debug_samples', num_positive=10, num_negative=10):
+    """Pozitif ve negatif örnekleri kaydet"""
+    import os
+    os.makedirs(output_dir, exist_ok=True)
     
-def val_aug():
-    Ag = A.Compose([
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        A.ToTensorV2()], bbox_params=A.BboxParams(
-            format='yolo', 
-            label_fields=['class_labels'],
-            min_area=0,
-            min_visibility=0.3,
-            clip=True))
-    return Ag
+    positive_samples = []
+    negative_samples = []
     
+    for idx in range(len(dataset)):
+        image, target = dataset[idx]
+        img_name = dataset.images[idx]
+        num_boxes = len(target['boxes'])
+        
+        if num_boxes > 0 and len(positive_samples) < num_positive:
+            positive_samples.append((idx, img_name, image, target))
+        elif num_boxes == 0 and len(negative_samples) < num_negative:
+            negative_samples.append((idx, img_name, image, target))
+        
+        if len(positive_samples) >= num_positive and len(negative_samples) >= num_negative:
+            break
+    
+    all_samples = positive_samples + negative_samples
+    random.shuffle(all_samples)
+    
+    for idx, img_name, image, target in all_samples:
+        if torch.is_tensor(image):
+            image_np = image.numpy().transpose(1, 2, 0)
+            image_np = image_np * [0.229, 0.224, 0.225] + [0.485, 0.456, 0.406]
+            image_np = np.clip(image_np, 0, 1)
+        else:
+            image_np = image
+        
+        fig, ax = plt.subplots(1, figsize=(12, 8))
+        ax.imshow(image_np)
+        
+        boxes = target['boxes'].cpu().numpy() if torch.is_tensor(target['boxes']) else target['boxes']
+        
+        for box in boxes:
+            x1, y1, x2, y2 = box
+            rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, linewidth=2, edgecolor='r', facecolor='none')
+            ax.add_patch(rect)
+        
+        sample_type = "POS" if len(boxes) > 0 else "NEG"
+        ax.set_title(f'{sample_type} - {img_name} - Boxes: {len(boxes)}')
+        ax.axis('off')
+        
+        save_name = f"{sample_type}_{os.path.splitext(img_name)[0]}.png"
+        plt.savefig(os.path.join(output_dir, save_name), bbox_inches='tight', dpi=100)
+        plt.close()
+        print(f"Saved: {save_name}")
+    
+    print(f"\n✓ {output_dir}/ klasörüne kaydedildi")
+
+# Çalıştır:
 
 def collate_fn(batch):
     """DataLoader için custom collate function"""
@@ -311,7 +364,6 @@ def clean_batch(images, targets, device):
                 tgt['labels'] = torch.zeros((0,), dtype=torch.int64, device=boxes.device)
                 tgt['area'] = boxes.new_zeros((0,))
         else:
-            # Boş kutu: negatif örnek
             tgt = tgt.copy()
             tgt['boxes'] = boxes
             tgt['area'] = boxes.new_zeros((0,)) if hasattr(boxes, 'new_zeros') else torch.zeros((0,), device=device)
@@ -322,102 +374,79 @@ def clean_batch(images, targets, device):
     return processed_images, processed_targets
 
 
-# ============================================================================
-# 2. MODEL OLUŞTURMA
-# ============================================================================
-def create_faster_rcnn_optimized(num_classes=2, pretrained=True):
+def create_faster_rcnn_optimized(num_classes=2, pretrained=True, img_size=640):
+    """
+    Çukur tespiti için optimize edilmiş Faster R-CNN
+    """
     from torchvision.models.detection import (
         FasterRCNN_ResNet50_FPN_Weights,
         fasterrcnn_resnet50_fpn
     )
-    
+    from torchvision.models.detection.anchor_utils import AnchorGenerator
+    from torchvision.models.detection.rpn import RPNHead
+
     weights = FasterRCNN_ResNet50_FPN_Weights.DEFAULT if pretrained else None
     model = fasterrcnn_resnet50_fpn(weights=weights)
-    
-    # Classifier değiştir
+
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
-    
-    # 🔧 RPN ANCHOR'LARINI AYARLA
-    from torchvision.models.detection.anchor_utils import AnchorGenerator
-    
-    anchor_sizes = ((16,), (32,), (64,), (128,), (256,), (512,))  # 6 seviye
-    aspect_ratios = ((0.5, 1.0, 2.0, 4.0),) * len(anchor_sizes)
-    
+
+    anchor_sizes = (
+        (8, 12, 16),
+        (24, 32, 48),
+        (64, 96, 128),
+        (192, 256, 320),
+        (384, 512, 768),
+    )
+    aspect_ratios = ((0.5, 1.0, 2.0, 3.0),) * len(anchor_sizes)
+
     model.rpn.anchor_generator = AnchorGenerator(
         sizes=anchor_sizes,
         aspect_ratios=aspect_ratios
     )
-    
-    # 🔧 RPN HİPERPARAMETRELER
-    model.rpn.fg_iou_thresh = 0.5  # 0.7 → 0.5 (daha kolay positive)
-    model.rpn.bg_iou_thresh = 0.3  # 0.3 sabit
-    model.rpn.batch_size_per_image = 512  # 256 → 512
-    model.rpn.positive_fraction = 0.5  # 0.5 sabit
-    
-    # 🔧 ROI HEAD HİPERPARAMETRELER
-    model.roi_heads.fg_iou_thresh = 0.5  # 0.5 sabit
-    model.roi_heads.bg_iou_thresh = 0.5  # 0.5 sabit
-    model.roi_heads.batch_size_per_image = 512  # 512 sabit
-    model.roi_heads.positive_fraction = 0.5  # 0.25 → 0.5
-    
-    print("create_faster_rcnn_optimized done")
-    return model
 
-def create_model(num_classes=2, pretrained=True, backbone='resnet50', model_name='retinanet'):
-    """RetinaNet veya Faster R-CNN modelini kurar"""
-    
-    if model_name == 'retinanet':
-        weights = RetinaNet_ResNet50_FPN_Weights.DEFAULT if pretrained else None
-        model = retinanet_resnet50_fpn(weights=weights)
-        # Kafa yeniden kur: num_classes'e göre
-        num_anchors = model.head.classification_head.num_anchors
-        in_channels = model.backbone.out_channels
-        model.head.classification_head = RetinaNetClassificationHead(
-            in_channels,
-            num_anchors,
-            num_classes,
-            norm_layer=None
-        )
-        # Bias/weight init (prior=0.01 ile başlangıçta düşük pozitif olasılığı ver)
-        torch.nn.init.normal_(model.head.classification_head.cls_logits.weight, std=0.01)
-        prior_prob = 0.01
-        bias_value = -math.log((1 - prior_prob) / prior_prob)
-        torch.nn.init.constant_(model.head.classification_head.cls_logits.bias, bias_value)
-        print("retinanet_resnet50_fpn")
-    else:
-        # Faster R-CNN (resnet50 veya mobilenet)
-        if backbone == 'resnet50':
-            from torchvision.models.detection import (
-                FasterRCNN_ResNet50_FPN_Weights,
-                fasterrcnn_resnet50_fpn
-            )
-            weights = FasterRCNN_ResNet50_FPN_Weights.DEFAULT if pretrained else None
-            model = fasterrcnn_resnet50_fpn(weights=weights)
-            print("fasterrcnn_resnet50_fpn")
-        else:
-            weights = FasterRCNN_MobileNet_V3_Large_FPN_Weights.DEFAULT if pretrained else None
-            model = fasterrcnn_mobilenet_v3_large_fpn(weights=weights)
-            print("fasterrcnn_mobilenet_v3")
-        
-        # Classifier'ı değiştir
-        in_features = model.roi_heads.box_predictor.cls_score.in_features
-        model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
-        
-        # Anchor box ayarlarını optimize et (çukur boyutlarına göre)
-        if hasattr(model, 'anchor_generator'):
-            model.anchor_generator.sizes = ((32,), (64,), (128,), (256,), (512,))
-            model.anchor_generator.aspect_ratios = ((0.5, 1.0, 2.0),) * len(model.anchor_generator.sizes)
-    print("create_model done")
+    in_channels = model.backbone.out_channels
+    num_anchors_per_location = model.rpn.anchor_generator.num_anchors_per_location()
+    num_anchors = num_anchors_per_location[0]
+
+    model.rpn.head = RPNHead(
+        in_channels=in_channels,
+        num_anchors=num_anchors
+    )
+
+    model.rpn.fg_iou_thresh = 0.5
+    model.rpn.bg_iou_thresh = 0.3
+    model.rpn.batch_size_per_image = 512
+    model.rpn.positive_fraction = 0.5
+
+    model.rpn.nms_thresh = 0.7
+    model.rpn.score_thresh = 0.0
+    model.rpn.pre_nms_top_n_train = 2000
+    model.rpn.post_nms_top_n_train = 2000
+    model.rpn.pre_nms_top_n_test = 1000
+    model.rpn.post_nms_top_n_test = 1000
+
+    model.roi_heads.fg_iou_thresh = 0.5
+    model.roi_heads.bg_iou_thresh = 0.5
+    model.roi_heads.batch_size_per_image = 512
+    model.roi_heads.positive_fraction = 0.5
+    model.roi_heads.nms_thresh = 0.4
+    model.roi_heads.score_thresh = 0.05
+    model.roi_heads.detections_per_img = 300
+
+    print("\n" + "=" * 70)
+    print("✓ FASTER R-CNN ÇUKUR-SPESİFİK KONFİGÜRASYON")
+    print("=" * 70)
+    print(f"Anchor Sizes: {anchor_sizes}")
+    print(f"Aspect Ratios: {aspect_ratios[0]}")
+    print(f"RPN Input Channels: {in_channels}")
+    print(f"Anchors per Location: {num_anchors}")
+    print("=" * 70 + "\n")
+
     return model
 
 
-# ============================================================================
-# 3. EĞİTİM FONKSİYONLARI
-# ============================================================================
-
-
-def train_one_epoch(model, optimizer, data_loader, device, epoch, scaler=None, warmup_epochs=5):
+def train_one_epoch(model, optimizer, data_loader, device, epoch, scaler=None, warmup_epochs=5, base_lr = 0.001):
     """Warmup ve gradient clipping ile geliştirilmiş eğitim"""
     model.train()
     total_loss = 0
@@ -425,38 +454,30 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, scaler=None, w
     
     pbar = tqdm(data_loader, desc=f'Epoch {epoch}')
     for batch_idx, (images, targets) in enumerate(pbar):
-        # Warmup learning rate (initial_lr yoksa mevcut lr'yi baz al)
         if epoch <= warmup_epochs:
-            warmup_factor = min(1.0, (batch_idx + 1) / len(data_loader))
+            warmup_progress = ((epoch - 1) * len(data_loader) + batch_idx) / (warmup_epochs * len(data_loader))
+            lr = base_lr * warmup_progress
             for param_group in optimizer.param_groups:
-                base_lr = param_group.get('initial_lr', param_group['lr'])
-                param_group['lr'] = base_lr * warmup_factor
+                param_group['lr'] = lr
         
         use_amp = scaler is not None and scaler.is_enabled()
         images, targets = clean_batch(images, targets, device)
         
         with torch.amp.autocast('cuda', enabled=use_amp):
             loss_dict = model(images, targets)
-
-            # DEBUG: İlk batch'te key'leri yazdır
-            if epoch == 1 and batch_idx == 0:
-                print("\nLoss Dictionary Keys:", list(loss_dict.keys()))
             
-            # RetinaNet ve Faster R-CNN için farklı loss anahtarlarını yönet
             if 'loss_classifier' in loss_dict:
                 losses = loss_dict['loss_classifier'] * 2.0 + \
                         loss_dict['loss_box_reg'] * 1.0 + \
                         loss_dict['loss_objectness'] * 1.0 + \
                         loss_dict['loss_rpn_box_reg'] * 1.0
             else:
-                # RetinaNet: classification + bbox_regression
                 losses = loss_dict.get('classification', 0) + loss_dict.get('bbox_regression', 0)
         
         optimizer.zero_grad(set_to_none=True)
 
         if use_amp:
             scaler.scale(losses).backward()
-            # Gradient clipping
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
@@ -476,10 +497,6 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, scaler=None, w
     return total_loss / max(num_steps, 1)
 
 
-# ============================================================================
-# 4. DEĞERLENDĐRME VE METRĐKLER
-# ============================================================================
-
 def calculate_iou(box1, box2):
     """IoU (Intersection over Union) hesapla"""
     x1 = max(box1[0], box2[0])
@@ -495,7 +512,7 @@ def calculate_iou(box1, box2):
     return intersection / union if union > 0 else 0
 
 
-def evaluate_model(model, data_loader, device, iou_threshold=0.5, conf_threshold=0.3):
+def evaluate_model(model, data_loader, device, iou_threshold=0.5, conf_threshold=0.25):
     """Model performansını değerlendir ve bilimsel metrikler hesapla"""
     model.eval()
     
@@ -512,7 +529,6 @@ def evaluate_model(model, data_loader, device, iou_threshold=0.5, conf_threshold
                 pred_boxes = output['boxes'].cpu().numpy()
                 pred_scores = output['scores'].cpu().numpy()
 
-                # NMS uygula
                 if len(pred_boxes) > 0:
                     import torchvision.ops as ops
                     nms_indices = ops.nms(
@@ -523,7 +539,6 @@ def evaluate_model(model, data_loader, device, iou_threshold=0.5, conf_threshold
                     pred_boxes = pred_boxes[nms_indices]
                     pred_scores = pred_scores[nms_indices]
                 
-                # Confidence threshold uygula
                 mask = pred_scores >= conf_threshold
                 pred_boxes = pred_boxes[mask]
                 pred_scores = pred_scores[mask]
@@ -562,7 +577,6 @@ def evaluate_model(model, data_loader, device, iou_threshold=0.5, conf_threshold
                 
                 fp += len([i for i in range(len(pred_boxes)) if i not in matched_pred])
     
-    # Metrikleri hesapla
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0
     f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
@@ -581,24 +595,6 @@ def evaluate_model(model, data_loader, device, iou_threshold=0.5, conf_threshold
     }
     
     return metrics
-
-
-def evaluate_loss(model, data_loader, device, use_amp=False):
-    """Validation loss hesaplar"""
-    model.eval()
-    total_loss = 0.0
-    steps = 0
-    
-    with torch.inference_mode():
-        for images, targets in data_loader:
-            images, targets = clean_batch(images, targets, device)
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                loss_dict = model(images, targets)
-                losses = sum(loss for loss in loss_dict.values())
-            total_loss += losses.item()
-            steps += 1
-    
-    return total_loss / max(steps, 1)
 
 
 def print_metrics_for_paper(metrics):
@@ -620,27 +616,24 @@ def print_metrics_for_paper(metrics):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Pothole tespiti için Faster R-CNN eğitimi')
-    parser.add_argument('--train-img-dir', type=str, default=None, help='Train görüntü klasörü')
-    parser.add_argument('--train-label-dir', type=str, default=None, help='Train label klasörü')
-    parser.add_argument('--val-img-dir', type=str, default=None, help='Validation görüntü klasörü')
-    parser.add_argument('--val-label-dir', type=str, default=None, help='Validation label klasörü')
-    parser.add_argument('--batch-size', type=int, default=None, help='Batch size')
-    parser.add_argument('--epochs', type=int, default=None, help='Epoch sayısı')
-    parser.add_argument('--lr', type=float, default=None, help='Learning rate')
-    parser.add_argument('--conf-threshold', type=float, default=None, help='Değerlendirme için confidence threshold')
-    parser.add_argument('--num-workers', type=int, default=None, help='DataLoader worker sayısı')
-    parser.add_argument('--output-dir', type=str, default=None, help='Model ve metriklerin kaydedileceği klasör')
-    parser.add_argument('--seed', type=int, default=None, help='Rastgelelik için seed')
-    parser.add_argument('--no-amp', action='store_true', help='Mixed precision kapat')
-    parser.add_argument('--no-pretrained', action='store_true', help='Pretrained backbone kullanma')
-    parser.add_argument('--model', type=str, default=None, choices=['retinanet', 'fasterrcnn'], help='Model tipi')
-    parser.add_argument('--device', type=str, default=None, help='cuda veya cpu')
+    parser.add_argument('--train-img-dir', type=str, default=None)
+    parser.add_argument('--train-label-dir', type=str, default=None)
+    parser.add_argument('--val-img-dir', type=str, default=None)
+    parser.add_argument('--val-label-dir', type=str, default=None)
+    parser.add_argument('--batch-size', type=int, default=None)
+    parser.add_argument('--epochs', type=int, default=None)
+    parser.add_argument('--lr', type=float, default=None)
+    parser.add_argument('--conf-threshold', type=float, default=None)
+    parser.add_argument('--num-workers', type=int, default=None)
+    parser.add_argument('--output-dir', type=str, default=None)
+    parser.add_argument('--seed', type=int, default=None)
+    parser.add_argument('--no-amp', action='store_true')
+    parser.add_argument('--no-pretrained', action='store_true')
+    parser.add_argument('--model', type=str, default=None, choices=['retinanet', 'fasterrcnn'])
+    parser.add_argument('--device', type=str, default=None)
+    parser.add_argument('--img-size', type=int, default=640, help='Görüntü boyutu (anchor hesaplaması için)')
     return parser.parse_args()
 
-
-# ============================================================================
-# 5. ANA EĞİTİM PIPELINE
-# ============================================================================
 
 def main():
     args = parse_args()
@@ -689,16 +682,17 @@ def main():
     print(f'Using device: {device}')
     print(f'Pin memory: {pin_memory} | Workers: {config.num_workers} | AMP: {amp_active}')
     
-    # Dataset ve DataLoader
     print('Loading datasets...')
     train_dataset = PotholeDataset(
-        config.train_img_dir, config.train_label_dir,
-        transforms=train_aug()
+        config.train_img_dir, 
+        config.train_label_dir,
+        transforms=get_augmentation_pipeline(train=True)
     )
     
     val_dataset = PotholeDataset(
-        config.val_img_dir, config.val_label_dir,
-        transforms=val_aug()
+        config.val_img_dir, 
+        config.val_label_dir,
+        transforms=get_augmentation_pipeline(train=False)
     )
     
     train_loader = DataLoader(
@@ -720,21 +714,26 @@ def main():
         persistent_workers=config.num_workers > 0,
         collate_fn=collate_fn
     )
-    # Kullanım:
-    debug_sample(train_dataset, idx=0)
-    debug_sample(val_dataset, idx=10)
+
+    # Debug için
+    debug_batch_samples(train_dataset, output_dir='debug_samples', num_positive=10, num_negative=10)
+    debug_sample(train_dataset, idx=0, save_path='debug_train.png')
+    debug_sample(val_dataset, idx=10, save_path='debug_val.png')
+    
+   
     
     print(f'Train samples: {len(train_dataset)}')
     print(f'Val samples: {len(val_dataset)}')
     
-    # Model oluştur
     print('\nCreating model...')
+    img_size = args.img_size if args else 640
     model = create_faster_rcnn_optimized(
         num_classes=config.num_classes,
-        pretrained=config.pretrained)
+        pretrained=config.pretrained,
+        img_size=img_size
+    )
     model.to(device)
     
-    # Optimizer ve scheduler
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(
         params, 
@@ -742,59 +741,43 @@ def main():
         momentum=0.9,
         weight_decay=0.0005
     )
+    
+    for param_group in optimizer.param_groups:
+        param_group['initial_lr'] = param_group['lr']
+    
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer,
-        milestones=[20, 40],
+        milestones=[35, 55],
         gamma=0.1
     )
     scaler = torch.cuda.amp.GradScaler(enabled=config.use_amp and device.type == 'cuda')
     
-    # Eğitim
     print('\nStarting training...')
-    print(f'Confidence Threshold: {config.conf_threshold}')
+    print(f'Initial Confidence Threshold: {config.conf_threshold}')
     best_f1 = -float('inf')
     best_model_path = os.path.join(config.output_dir, 'best_pothole_model.pth')
     metrics_path = os.path.join(config.output_dir, 'metrics.json')
     
-    # Main fonksiyonunda:
     for epoch in range(1, config.num_epochs + 1):
-        # Warmup uygula (ilk 5 epoch)
-        warmup = epoch <= config.warmup_epochs
         train_loss = train_one_epoch(
             model, optimizer, train_loader, device, 
-            epoch, scaler=scaler, warmup_epochs=config.warmup_epochs
+            epoch, scaler=scaler, warmup_epochs=config.warmup_epochs, base_lr = config.learning_rate
         )
         
-        # WARMUP BİTTİKTEN SONRA scheduler'ı kullan
         if epoch > config.warmup_epochs:
             lr_scheduler.step()
         
-        print(f'Epoch {epoch} - train loss: {train_loss:.4f} - LR: {optimizer.param_groups[0]["lr"]:.6f}')
+        print(f'Epoch {epoch}/{config.num_epochs} - train loss: {train_loss:.4f} - LR: {optimizer.param_groups[0]["lr"]:.6f}')
         
-        # Validation için CONFIDENCE THRESHOLD'U DÜŞÜR
-        if epoch % 3 == 0:
+        if epoch % 3 == 0 or epoch == config.num_epochs:
             print(f'\nValidating epoch {epoch}...')
-            # İlk validation'larda çok düşük threshold kullan
-            current_threshold = 0.3
-            metrics = evaluate_model(model, val_loader, device, conf_threshold=current_threshold)
+            metrics = evaluate_model(model, val_loader, device, conf_threshold=config.conf_threshold)
             print_metrics_for_paper(metrics)
-            
-            # Dynamic threshold: hiç tahmin yoksa eşiği düşür, FP ağır basıyorsa yükselt
-            """tp, fp = metrics['True Positives'], metrics['False Positives']
-            if tp == 0 and fp == 0:
-                config.conf_threshold = max(0.05, config.conf_threshold - 0.05)
-                print(f'↓ No predictions; confidence threshold decreased to {config.conf_threshold:.2f}')
-            elif fp > tp and metrics['Precision'] < 0.4:
-                config.conf_threshold = min(config.conf_threshold + 0.05, 0.8)
-                print(f'↑ High FP; confidence threshold increased to {config.conf_threshold:.2f}')
-            elif metrics['Recall'] < 0.4:
-                config.conf_threshold = max(config.conf_threshold - 0.05, 0.05)
-                print(f'↓ Low recall; confidence threshold decreased to {config.conf_threshold:.2f}')
             
             if metrics['F1-Score'] > best_f1:
                 best_f1 = metrics['F1-Score']
                 torch.save(model.state_dict(), best_model_path)
-                print(f'✓ Best model saved! F1-Score: {best_f1:.4f}')"""
+                print(f'✓ Best model saved! F1-Score: {best_f1:.4f}')
     
     print('\n\nFINAL EVALUATION:')
     if os.path.exists(best_model_path):
@@ -802,7 +785,6 @@ def main():
         final_metrics = evaluate_model(model, val_loader, device, conf_threshold=config.conf_threshold)
         print_metrics_for_paper(final_metrics)
         
-        # JSON için numpy/tensor tiplerini dönüştür
         final_metrics_json = {}
         for k, v in final_metrics.items():
             if isinstance(v, (np.floating,)):
@@ -821,7 +803,7 @@ def main():
         print(f'✓ Model saved: {best_model_path}')
         print(f'✓ Metrics saved: {metrics_path}')
     else:
-        print('Best model bulunamadı, kaydetme/validation adımlarını kontrol edin.')
+        print('Best model bulunamadı!')
 
 
 if __name__ == '__main__':
