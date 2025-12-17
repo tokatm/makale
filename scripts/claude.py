@@ -10,12 +10,8 @@ import cv2
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
-from torchvision.models.detection import (
-    FasterRCNN_MobileNet_V3_Large_FPN_Weights,
-    fasterrcnn_mobilenet_v3_large_fpn,
-    RetinaNet_ResNet50_FPN_Weights,
-    retinanet_resnet50_fpn,
-)
+from torchvision.models.detection import FasterRCNN_MobileNet_V3_Large_FPN_Weights, fasterrcnn_mobilenet_v3_large_fpn, RetinaNet_ResNet50_FPN_Weights, retinanet_resnet50_fpn
+
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.retinanet import RetinaNetClassificationHead
 from tqdm import tqdm
@@ -33,9 +29,9 @@ def default_num_workers():
 class TrainConfig:
     batch_size: int = 16
     num_epochs: int = 70
-    learning_rate: float = 0.001
+    learning_rate: float = 0.005
     num_classes: int = 2
-    conf_threshold: float = 0.05
+    conf_threshold: float = 0.15
     model_name: str = 'fasterrcnn'
     backbone: str = 'resnet50'
     num_workers: int = default_num_workers()
@@ -47,7 +43,7 @@ class TrainConfig:
     seed: int = 42
     use_amp: bool = True
     pretrained: bool = True
-    warmup_epochs: int = 5
+    #warmup_epochs: int = 5
 
 
 def seed_everything(seed: int):
@@ -181,51 +177,60 @@ class PotholeDataset(Dataset):
         
         if os.path.exists(label_path) and os.path.getsize(label_path) > 0:
             with open(label_path, 'r') as f:
-                lines = f.readlines()
-                for line in lines:
+                for line in f:
                     parts = line.strip().split()
                     if len(parts) == 5:
                         class_id = int(parts[0])
                         if class_id == 0:
                             x_center, y_center, width, height = map(float, parts[1:])
-                            x_center = np.clip(x_center, 0.0, 1.0)
-                            y_center = np.clip(y_center, 0.0, 1.0)
-                            width = np.clip(width, 0.0, 1.0)
-                            height = np.clip(height, 0.0, 1.0)
-                            boxes.append([x_center, y_center, width, height])
-                            labels.append(1)
+                            # Geçerlilik kontrolü
+                            if 0 < width <= 1 and 0 < height <= 1:
+                                boxes.append([x_center, y_center, width, height])
+                                labels.append(1)
         
-        # Albumentations transformunu uygula
         if self.transforms:
             transformed = self.transforms(
                 image=image,
                 bboxes=boxes,
                 class_labels=labels
             )
-            image = transformed['image']  # ToTensorV2 ile tensor'e dönüştü
-            boxes = transformed['bboxes']
-            labels = transformed['class_labels']
+            image = transformed['image']
+            boxes = list(transformed['bboxes'])
+            labels = list(transformed['class_labels'])  # ✅ Transform sonrası güncellendi
             h, w = image.shape[1], image.shape[2]
         
         if len(boxes) > 0:
             boxes = self.yolo_to_pascal_voc(boxes, w, h)
-            boxes = self.clip_pascal_boxes(boxes, w, h)
-            boxes = torch.as_tensor(boxes, dtype=torch.float32)
-            labels = torch.as_tensor(labels, dtype=torch.int64)
+            
+            # ✅ Clip ve labels senkronizasyonu
+            valid_boxes = []
+            valid_labels = []
+            for i, (x_min, y_min, x_max, y_max) in enumerate(boxes):
+                x_min = np.clip(x_min, 0, w)
+                y_min = np.clip(y_min, 0, h)
+                x_max = np.clip(x_max, 0, w)
+                y_max = np.clip(y_max, 0, h)
+                if x_max > x_min + 1 and y_max > y_min + 1:  # Min 1px boyut
+                    valid_boxes.append([x_min, y_min, x_max, y_max])
+                    valid_labels.append(labels[i])
+            
+            boxes = torch.as_tensor(valid_boxes, dtype=torch.float32) if valid_boxes else torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.as_tensor(valid_labels, dtype=torch.int64) if valid_labels else torch.zeros((0,), dtype=torch.int64)
         else:
             boxes = torch.zeros((0, 4), dtype=torch.float32)
             labels = torch.zeros((0,), dtype=torch.int64)
+        
+        area = (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0]) if len(boxes) > 0 else torch.zeros((0,), dtype=torch.float32)
         
         target = {
             'boxes': boxes,
             'labels': labels,
             'image_id': torch.tensor([idx]),
-            'area': (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0]) if len(boxes) > 0 else torch.zeros((0,), dtype=torch.float32),
+            'area': area,
             'iscrowd': torch.zeros((len(boxes),), dtype=torch.int64)
         }
         
         return image, target
-
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -374,92 +379,54 @@ def clean_batch(images, targets, device):
     return processed_images, processed_targets
 
 
-def create_faster_rcnn_optimized(num_classes=2, pretrained=True, img_size=640):
+def create_fcos_optimized(num_classes=2, pretrained=True, img_size=640):
     """
-    Çukur tespiti için optimize edilmiş Faster R-CNN
+    Çukur tespiti için optimize edilmiş FCOS
     """
-    from torchvision.models.detection import (
-        FasterRCNN_ResNet50_FPN_Weights,
-        fasterrcnn_resnet50_fpn
+    from torchvision.models.detection import fcos_resnet50_fpn, FCOS_ResNet50_FPN_Weights
+    
+    weights = FCOS_ResNet50_FPN_Weights.DEFAULT if pretrained else None
+    model = fcos_resnet50_fpn(weights=weights)
+    
+    # Classification head'i değiştir
+    num_anchors = model.head.classification_head.num_anchors
+    in_channels = model.head.classification_head.conv[0].in_channels
+    
+    model.head.classification_head.num_classes = num_classes
+    model.head.classification_head.cls_logits = torch.nn.Conv2d(
+        in_channels, num_anchors * num_classes, kernel_size=3, stride=1, padding=1
     )
-    from torchvision.models.detection.anchor_utils import AnchorGenerator
-    from torchvision.models.detection.rpn import RPNHead
-
-    weights = FasterRCNN_ResNet50_FPN_Weights.DEFAULT if pretrained else None
-    model = fasterrcnn_resnet50_fpn(weights=weights)
-
-    in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
-
-    anchor_sizes = (
-        (8, 12, 16),
-        (24, 32, 48),
-        (64, 96, 128),
-        (192, 256, 320),
-        (384, 512, 768),
-    )
-    aspect_ratios = ((0.5, 1.0, 2.0, 3.0),) * len(anchor_sizes)
-
-    model.rpn.anchor_generator = AnchorGenerator(
-        sizes=anchor_sizes,
-        aspect_ratios=aspect_ratios
-    )
-
-    in_channels = model.backbone.out_channels
-    num_anchors_per_location = model.rpn.anchor_generator.num_anchors_per_location()
-    num_anchors = num_anchors_per_location[0]
-
-    model.rpn.head = RPNHead(
-        in_channels=in_channels,
-        num_anchors=num_anchors
-    )
-
-    model.rpn.fg_iou_thresh = 0.5
-    model.rpn.bg_iou_thresh = 0.3
-    model.rpn.batch_size_per_image = 512
-    model.rpn.positive_fraction = 0.5
-
-    model.rpn.nms_thresh = 0.7
-    model.rpn.score_thresh = 0.0
-    model.rpn.pre_nms_top_n_train = 2000
-    model.rpn.post_nms_top_n_train = 2000
-    model.rpn.pre_nms_top_n_test = 1000
-    model.rpn.post_nms_top_n_test = 1000
-
-    model.roi_heads.fg_iou_thresh = 0.5
-    model.roi_heads.bg_iou_thresh = 0.5
-    model.roi_heads.batch_size_per_image = 512
-    model.roi_heads.positive_fraction = 0.5
-    model.roi_heads.nms_thresh = 0.4
-    model.roi_heads.score_thresh = 0.05
-    model.roi_heads.detections_per_img = 300
-
+    
+    # ✅ Proper initialization
+    torch.nn.init.normal_(model.head.classification_head.cls_logits.weight, std=0.01)
+    torch.nn.init.constant_(model.head.classification_head.cls_logits.bias, -math.log((1 - 0.01) / 0.01))
+    
+    # FCOS parametreleri
+    model.score_thresh = 0.05
+    model.nms_thresh = 0.5
+    model.detections_per_img = 50
+    model.topk_candidates = 1000
+    
     print("\n" + "=" * 70)
-    print("✓ FASTER R-CNN ÇUKUR-SPESİFİK KONFİGÜRASYON")
+    print("✓ FCOS MODELİ ÇUKUR TESPİTİ")
     print("=" * 70)
-    print(f"Anchor Sizes: {anchor_sizes}")
-    print(f"Aspect Ratios: {aspect_ratios[0]}")
-    print(f"RPN Input Channels: {in_channels}")
-    print(f"Anchors per Location: {num_anchors}")
+    print(f"Num Classes: {num_classes}")
+    print(f"Score Threshold: {model.score_thresh}")
+    print(f"NMS Threshold: {model.nms_thresh}")
+    print(f"Detections per Image: {model.detections_per_img}")
     print("=" * 70 + "\n")
-
+    
     return model
 
 
-def train_one_epoch(model, optimizer, data_loader, device, epoch, scaler=None, warmup_epochs=5, base_lr = 0.001):
-    """Warmup ve gradient clipping ile geliştirilmiş eğitim"""
+def train_one_epoch(model, optimizer, data_loader, device, epoch, scaler=None):
+    """Gradient clipping ile eğitim, warmup YOK"""
     model.train()
     total_loss = 0
     num_steps = 0
     
     pbar = tqdm(data_loader, desc=f'Epoch {epoch}')
     for batch_idx, (images, targets) in enumerate(pbar):
-        if epoch <= warmup_epochs:
-            warmup_progress = ((epoch - 1) * len(data_loader) + batch_idx) / (warmup_epochs * len(data_loader))
-            lr = base_lr * warmup_progress
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = lr
-        
         use_amp = scaler is not None and scaler.is_enabled()
         images, targets = clean_batch(images, targets, device)
         
@@ -471,6 +438,9 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, scaler=None, w
                         loss_dict['loss_box_reg'] * 1.0 + \
                         loss_dict['loss_objectness'] * 1.0 + \
                         loss_dict['loss_rpn_box_reg'] * 1.0
+
+            elif 'classification' in loss_dict:  # FCOS/RetinaNet
+                losses = loss_dict['classification'] + loss_dict['bbox_regression'] + loss_dict.get('bbox_ctrness', 0)
             else:
                 losses = loss_dict.get('classification', 0) + loss_dict.get('bbox_regression', 0)
         
@@ -489,6 +459,7 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, scaler=None, w
         
         total_loss += losses.item()
         num_steps += 1
+        
         pbar.set_postfix({
             'loss': f'{losses.item():.4f}',
             'lr': f"{optimizer.param_groups[0]['lr']:.6f}"
@@ -512,7 +483,7 @@ def calculate_iou(box1, box2):
     return intersection / union if union > 0 else 0
 
 
-def evaluate_model(model, data_loader, device, iou_threshold=0.5, conf_threshold=0.25):
+def evaluate_model(model, data_loader, device, iou_threshold=0.5, conf_threshold=0.15):
     """Model performansını değerlendir ve bilimsel metrikler hesapla"""
     model.eval()
     
@@ -629,7 +600,7 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--no-amp', action='store_true')
     parser.add_argument('--no-pretrained', action='store_true')
-    parser.add_argument('--model', type=str, default=None, choices=['retinanet', 'fasterrcnn'])
+    parser.add_argument('--model', type=str, default=None, choices=['retinanet', 'fasterrcnn', 'fcos'])
     parser.add_argument('--device', type=str, default=None)
     parser.add_argument('--img-size', type=int, default=640, help='Görüntü boyutu (anchor hesaplaması için)')
     return parser.parse_args()
@@ -727,7 +698,7 @@ def main():
     
     print('\nCreating model...')
     img_size = args.img_size if args else 640
-    model = create_faster_rcnn_optimized(
+    model = create_fcos_optimized(
         num_classes=config.num_classes,
         pretrained=config.pretrained,
         img_size=img_size
@@ -745,10 +716,11 @@ def main():
     for param_group in optimizer.param_groups:
         param_group['initial_lr'] = param_group['lr']
     
-    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        milestones=[35, 55],
-        gamma=0.1
+        mode = 'max',
+        patience = 3,
+        factor= 0.5
     )
     scaler = torch.cuda.amp.GradScaler(enabled=config.use_amp and device.type == 'cuda')
     
@@ -761,12 +733,9 @@ def main():
     for epoch in range(1, config.num_epochs + 1):
         train_loss = train_one_epoch(
             model, optimizer, train_loader, device, 
-            epoch, scaler=scaler, warmup_epochs=config.warmup_epochs, base_lr = config.learning_rate
+            epoch, scaler=scaler
         )
-        
-        if epoch > config.warmup_epochs:
-            lr_scheduler.step()
-        
+                
         print(f'Epoch {epoch}/{config.num_epochs} - train loss: {train_loss:.4f} - LR: {optimizer.param_groups[0]["lr"]:.6f}')
         
         if epoch % 3 == 0 or epoch == config.num_epochs:
@@ -774,6 +743,8 @@ def main():
             metrics = evaluate_model(model, val_loader, device, conf_threshold=config.conf_threshold)
             print_metrics_for_paper(metrics)
             
+            lr_scheduler.step(metrics['F1-Score'])
+
             if metrics['F1-Score'] > best_f1:
                 best_f1 = metrics['F1-Score']
                 torch.save(model.state_dict(), best_model_path)
